@@ -12,3 +12,5 @@ fastapi
 faiss-cpu
 sentence-transformers
 numpy
+python-multipart
+requests

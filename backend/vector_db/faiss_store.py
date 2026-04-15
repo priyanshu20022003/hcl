@@ -6,6 +6,7 @@ vectors) with parallel metadata storage for document chunks.
 """
 
 import json
+import threading
 from pathlib import Path
 
 import faiss
@@ -21,6 +22,7 @@ class FaissStore:
         # Inner-product on L2-normalised vectors == cosine similarity
         self.index = faiss.IndexFlatIP(EMBEDDING_DIM)
         self.metadata: list[dict] = []  # parallel list: one entry per vector
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Build
@@ -37,8 +39,16 @@ class FaissStore:
         if len(embeddings) != len(metadata_list):
             raise ValueError("embeddings and metadata_list must have the same length")
         embeddings = np.ascontiguousarray(embeddings, dtype=np.float32)
-        self.index.add(embeddings)
-        self.metadata.extend(metadata_list)
+        with self._lock:
+            self.index.add(embeddings)
+            self.metadata.extend(metadata_list)
+
+    def add_single(self, embedding: np.ndarray, metadata: dict):
+        """Add a single vector and its metadata to the index."""
+        emb = np.ascontiguousarray(embedding.reshape(1, -1), dtype=np.float32)
+        with self._lock:
+            self.index.add(emb)
+            self.metadata.append(metadata)
 
     # ------------------------------------------------------------------
     # Search

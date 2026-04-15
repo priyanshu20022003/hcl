@@ -6,7 +6,10 @@ via the official sarvamai SDK.
 """
 
 import base64
+import time
 from pathlib import Path
+
+import requests
 
 
 class SarvamClient:
@@ -110,20 +113,75 @@ class SarvamClient:
             return None
 
     # ------------------------------------------------------------------
-    # Document intelligence
+    # Document intelligence (OCR)
     # ------------------------------------------------------------------
-    def extract_document_text(self, file_path: Path, language: str) -> str | None:
-        """Extract text from a document using Sarvam document intelligence."""
+    def extract_document_text(self, file_path: Path, language: str = "en-IN") -> str | None:
+        """Extract text from a document using Sarvam document intelligence.
+        
+        This handles the asynchronous job creation, polling, and content fetching.
+        """
         if not self.enabled or not self.client:
             return None
+            
         try:
+            # 1. Create the job
+            print(f"[sarvam] Creating doc-intel job for {file_path.name}...")
             job = self.client.document_intelligence.create_job(
                 language=language,
                 output_format="md",
             )
+            
+            # 2. Upload the file
             job.upload_file(str(file_path))
-            result = job.get_result()
-            return getattr(result, "output", None) or getattr(result, "markdown", None)
+            
+            # 3. Poll for completion
+            max_retries = 30  # ~30-60 seconds max
+            retry_count = 0
+            status = "PENDING"
+            while retry_count < max_retries:
+                status = job.get_status()
+                print(f"[sarvam] Job {job.job_id} status: {status}")
+                
+                if status == "COMPLETED":
+                    break
+                elif status in ("FAILED", "CANCELLED"):
+                    print(f"[sarvam] Job failed with status: {status}")
+                    return None
+                    
+                time.sleep(2)
+                retry_count += 1
+            
+            if status != "COMPLETED":
+                print("[sarvam] Job timed out.")
+                return None
+            
+            # 4. Get download URLs and fetch the markdown content
+            urls = job.get_download_urls()
+            if not urls:
+                print("[sarvam] No download URLs returned.")
+                return None
+            
+            # Usually returns a list of signed URLs. We want the markdown one.
+            md_url = None
+            if isinstance(urls, dict):
+                md_url = urls.get("md") or urls.get("markdown")
+            elif isinstance(urls, list) and urls:
+                for u in urls:
+                    if ".md" in u.lower() or "markdown" in u.lower():
+                        md_url = u
+                        break
+                if not md_url:
+                    md_url = urls[0]
+            
+            if not md_url:
+                print("[sarvam] Could not find markdown URL.")
+                return None
+                
+            # 5. Fetch the actual content
+            resp = requests.get(md_url, timeout=20)
+            resp.raise_for_status()
+            return resp.text
+            
         except Exception as exc:
             print(f"[sarvam] doc-extract error: {exc}")
             return None

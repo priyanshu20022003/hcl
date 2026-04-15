@@ -5,8 +5,15 @@ All endpoints maintain the same contract as the original Flask app so the
 Streamlit frontend works without any changes.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, File, UploadFile
 from pydantic import BaseModel
+import tempfile
+import os
+import sqlite3
+from pathlib import Path
+from datetime import datetime
+
+from ..vector_db.embeddings import get_embedding
 
 router = APIRouter(prefix="/api")
 
@@ -206,8 +213,6 @@ def submit_feedback(body: FeedbackRequest, request: Request, current_user: dict 
     if not body.query.strip():
         raise HTTPException(status_code=400, detail="Query is required for feedback")
 
-    import sqlite3
-    from datetime import datetime
     state = get_state(request)
     conn = sqlite3.connect(str(state.db_path))
     conn.execute(
@@ -227,7 +232,99 @@ def submit_feedback(body: FeedbackRequest, request: Request, current_user: dict 
     )
     conn.commit()
     conn.close()
-    return {"message": "Feedback saved.", "appliedSignal": "positive" if body.rating > 0 else "negative"}
+
+    # ── Real-time Learning (Update Experience Memory Brain & Utility) ────
+    # If it's a correction or a high-quality (1) rating, learn from it
+    if body.correction or body.rating == 1:
+        try:
+            # Update Document Utility if it was a high-quality match
+            if body.rating == 1 and body.topDocumentId:
+                conn = sqlite3.connect(str(state.db_path))
+                conn.execute(
+                    "UPDATE documents SET utility_score = utility_score + 1 WHERE id = ?",
+                    (body.topDocumentId,)
+                )
+                conn.commit()
+                conn.close()
+                print(f"[learning] Document utility increased for: {body.topDocumentId}")
+
+            # 1. Embed the query to use as a semantic key
+            query_emb = get_embedding(body.query)
+            
+            # 2. Add as a semantic memory
+            memory_data = {
+                "query": body.query,
+                "correction": body.correction or body.comment or "",
+                "rating": body.rating,
+                "type": "correction" if body.correction else "gold_answer",
+                "content": body.correction if body.correction else "User-validated high-quality response."
+            }
+            state.experience_store.add_single(query_emb, memory_data)
+            
+            # 3. Persist to disk immediately
+            state.experience_store.save(state.experience_dir)
+            print(f"[learning] New experience memory saved for query: {body.query[:50]}...")
+        except Exception as e:
+            print(f"[learning] Error updating experience brain: {e}")
+
+    return {"message": "Feedback saved and learned.", "appliedSignal": "positive" if body.rating > 0 else "negative"}
+
+
+# ── Voice ────────────────────────────────────────────────────────────
+@router.post("/voice/transcribe")
+async def transcribe_voice(request: Request, file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    state = get_state(request)
+    
+    if not state.sarvam.enabled:
+        raise HTTPException(status_code=503, detail="Sarvam API is not configured.")
+
+    # Save the uploaded file temporarily
+    suffix = Path(file.filename).suffix if file.filename else ".wav"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
+
+    try:
+        # Call Sarvam STT (which expects a pathlib.Path)
+        result = state.sarvam.speech_to_text(tmp_path)
+        if not result or not result.get("transcript"):
+            raise HTTPException(status_code=500, detail="Failed to transcribe audio.")
+        return {"transcript": result["transcript"].strip(), "language": result.get("language_code")}
+    finally:
+        if tmp_path.exists():
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+@router.post("/ocr")
+async def transcribe_ocr(request: Request, file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    state = get_state(request)
+    
+    if not state.sarvam.enabled:
+        raise HTTPException(status_code=503, detail="Sarvam API is not configured.")
+
+    # Save the uploaded file temporarily
+    suffix = Path(file.filename).suffix if file.filename else ".png"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
+
+    try:
+        # Call Sarvam Document Intelligence
+        text = state.sarvam.extract_document_text(tmp_path)
+        if not text:
+            raise HTTPException(status_code=500, detail="Failed to extract text from image.")
+        return {"text": text.strip()}
+    finally:
+        if tmp_path.exists():
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 # ── Dashboard ────────────────────────────────────────────────────────

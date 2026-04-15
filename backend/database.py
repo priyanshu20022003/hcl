@@ -77,7 +77,8 @@ def initialize_database(base_dir: Path):
             file_path TEXT NOT NULL,
             last_updated TEXT NOT NULL,
             uploaded_by TEXT NOT NULL,
-            access_roles TEXT NOT NULL DEFAULT 'admin,staff,auditor,user'
+            access_roles TEXT NOT NULL DEFAULT 'admin,staff,auditor,user',
+            utility_score INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS chunks (
@@ -128,6 +129,10 @@ def initialize_database(base_dir: Path):
         cursor.execute(
             "ALTER TABLE documents ADD COLUMN access_roles TEXT NOT NULL DEFAULT 'admin,staff,auditor,user'"
         )
+    if "utility_score" not in document_columns:
+        cursor.execute(
+            "ALTER TABLE documents ADD COLUMN utility_score INTEGER DEFAULT 0"
+        )
 
     seed_documents = json.loads((data_dir / "documents.json").read_text(encoding="utf-8"))
     for document in seed_documents:
@@ -136,9 +141,9 @@ def initialize_database(base_dir: Path):
             INSERT OR REPLACE INTO documents (
                 id, title, document_type, category, department, insurance_scheme,
                 effective_date, language, version, summary, content, file_name,
-                file_path, last_updated, uploaded_by, access_roles
+                file_path, last_updated, uploaded_by, access_roles, utility_score
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 document["id"],
@@ -157,6 +162,7 @@ def initialize_database(base_dir: Path):
                 document["last_updated"],
                 "USR-001",
                 document.get("access_roles", "admin,staff,auditor,user"),
+                0,
             ),
         )
         cursor.execute("DELETE FROM chunks WHERE document_id = ?", (document["id"],))

@@ -9,8 +9,16 @@ __pycache__/
 backend/.env
 
 # Local database and uploads
-backend/data/app.db
+backend/data/*.db
+backend/data/*.sqlite
+backend/data/*.faiss
+backend/data/*.index
+backend/data/*.json
 backend/storage/uploads/
+
+# Binaries & Large Files
+*.pptx
+*.pdf
 
 # Streamlit cache
 .streamlit/

@@ -25,6 +25,7 @@ from fastapi.responses import RedirectResponse
 # Local imports
 from backend.config import settings
 from backend.database import initialize_database
+from backend.vector_db.faiss_store import FaissStore
 from backend.vector_db.indexer import build_index
 from backend.llm_support.sarvam_client import SarvamClient
 from backend.llm_support.rag_chain import RAGChain
@@ -34,6 +35,7 @@ from backend.api.routes import router
 BASE_DIR = Path(__file__).resolve().parent
 DOCUMENTS_PATH = BASE_DIR / "data" / "documents.json"
 FAISS_INDEX_DIR = BASE_DIR / "data" / "faiss_index"
+EXPERIENCE_INDEX_DIR = BASE_DIR / "data" / "experience_index"
 
 # ── FastAPI app ──────────────────────────────────────────────────────
 app = FastAPI(
@@ -68,6 +70,14 @@ def startup():
         max_chunk_chars=settings.max_chunk_chars,
     )
 
+    # 2.5 Experience Memory Brain (Learned Lessons)
+    print("[startup] Initialising Experience Memory Brain ...")
+    experience_store = FaissStore()
+    if (EXPERIENCE_INDEX_DIR / "index.faiss").exists():
+        experience_store.load(EXPERIENCE_INDEX_DIR)
+    else:
+        EXPERIENCE_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
     # 3. Sarvam AI client
     print("[startup] Initialising Sarvam AI client ...")
     sarvam = SarvamClient(
@@ -75,8 +85,13 @@ def startup():
         chat_model=settings.chat_model,
     )
 
-    # 4. RAG chain
-    rag_chain = RAGChain(faiss_store=faiss_store, sarvam=sarvam)
+    # 4. RAG chain (Pass both brains)
+    rag_chain = RAGChain(
+        faiss_store=faiss_store,
+        sarvam=sarvam,
+        db_path=db_state["db_path"],
+        experience_store=experience_store
+    )
 
     # 5. User lookup for auth
     user_lookup: dict[str, dict] = {}
@@ -87,6 +102,8 @@ def startup():
     app.state.db_path = db_state["db_path"]
     app.state.storage_dir = db_state["storage_dir"]
     app.state.faiss_store = faiss_store
+    app.state.experience_store = experience_store
+    app.state.experience_dir = EXPERIENCE_INDEX_DIR
     app.state.sarvam = sarvam
     app.state.rag_chain = rag_chain
     app.state.user_lookup = user_lookup

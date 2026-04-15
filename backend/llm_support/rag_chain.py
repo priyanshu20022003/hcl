@@ -10,6 +10,9 @@ Pipeline:
 """
 
 import re
+import sqlite3
+import numpy as np
+from pathlib import Path
 
 from ..vector_db.embeddings import get_embedding
 from ..vector_db.faiss_store import FaissStore
@@ -19,9 +22,11 @@ from .sarvam_client import SarvamClient
 class RAGChain:
     """End-to-end RAG pipeline: FAISS retrieval → Sarvam LLM generation."""
 
-    def __init__(self, faiss_store: FaissStore, sarvam: SarvamClient):
+    def __init__(self, faiss_store: FaissStore, sarvam: SarvamClient, db_path: Path = None, experience_store: FaissStore = None):
         self.store = faiss_store
         self.sarvam = sarvam
+        self.db_path = db_path
+        self.experience_store = experience_store
 
     # ------------------------------------------------------------------
     # Public API
@@ -33,36 +38,49 @@ class RAGChain:
         top_k: int = 5,
         include_voice: bool = False,
     ) -> dict:
-        """Run the full RAG pipeline and return a structured response.
-
-        Returns a dict with keys:
-            query, detectedLanguage, summary, sources,
-            topDocument, topDocumentId, confidence, voicePlayback
-        """
+        """Run the full RAG pipeline and return a structured response."""
         detected_lang = self._detect_language(query, preferred_language)
 
         # 1. Retrieve relevant chunks from FAISS
         query_embedding = get_embedding(query)
         results = self.store.search(query_embedding, top_k=top_k)
+        
+        # 1.5 Augment results with dynamic utility scores from DB
+        results = self._augment_with_utility(results)
 
-        if not results:
+        # 2. Retrieve past lessons (Semantic Memory from Experience Brain)
+        lessons = self._get_past_lessons(query_embedding)
+        lessons_string = ""
+        if lessons:
+            lessons_string = "\n".join([f"- Verified Correction: {l}" for l in lessons])
+
+        if not results and not lessons:
             return self._no_info_response(query, detected_lang)
 
-        # 2. De-duplicate by document and build context
+        # 3. De-duplicate by document and build context
         sources = self._build_sources(results)
         context_string = self._format_context(results)
 
-        # 3. Generate answer via Sarvam LLM
+        # 4. Generate answer via Sarvam LLM
         system_prompt = (
             "You are PolicySarthi, a hospital policy assistant using retrieval-augmented generation. "
             "Answer strictly based on the provided context. If the answer is not in the context, "
-            "say that clearly. Do not invent policies, steps, or documents. "
-            "Be concise and helpful. Use bullet points where appropriate."
+            "say that clearly. Do not invent policies, steps, or documents.\n\n"
         )
+        
+        if lessons_string:
+            system_prompt += (
+                "IMPORTANT: You have previously learned the following corrections for similar queries. "
+                "Incorporate these verified corrections into your response:\n"
+                f"{lessons_string}\n\n"
+            )
+            
+        system_prompt += "Be concise and helpful. Use bullet points where appropriate."
+
         user_prompt = (
             f"Question: {query}\n\n"
             f"Retrieved context:\n{context_string}\n\n"
-            f"Provide a clear, grounded answer based only on the above context."
+            f"Provide a clear, grounded answer based on the above context and your learned lessons."
         )
 
         llm_answer = self.sarvam.chat(system_prompt, user_prompt)
@@ -72,16 +90,16 @@ class RAGChain:
         else:
             summary = self._fallback_summary(query, results, sources)
 
-        # 4. Translate to Hindi if needed
+        # 5. Translate to Hindi if needed
         if detected_lang == "Hindi":
             translated = self.sarvam.translate(summary, "en-IN", "hi-IN")
             if translated:
                 summary = translated
 
-        # 5. Build confidence signal
+        # 6. Build confidence signal
         confidence = self._build_confidence(results)
 
-        # 6. Voice (optional)
+        # 7. Voice (optional)
         voice = None
         if include_voice:
             tts_lang = "hi-IN" if detected_lang == "Hindi" else "en-IN"
@@ -99,11 +117,32 @@ class RAGChain:
             "topDocumentId": top["document_id"] if top else None,
             "confidence": confidence,
             "voicePlayback": voice,
+            "appliedLessons": lessons
         }
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+    def _get_past_lessons(self, query_embedding: np.ndarray) -> list[str]:
+        """Semantically retrieve past corrections or gold answers from the Experience Brain."""
+        if not self.experience_store or self.experience_store.total_vectors == 0:
+            return []
+
+        lessons = []
+        try:
+            # Semantic search on experience brain
+            # Threshold of 0.75 to ensure only highly relevant "past experiences" are used
+            matches = self.experience_store.search(query_embedding, top_k=3)
+            for m in matches:
+                if m.get("score", 0) > 0.75:
+                    correction = m.get("correction") or m.get("content")
+                    if correction:
+                        lessons.append(correction)
+        except Exception as e:
+            print(f"[rag_chain] Error retrieving semantic lessons: {e}")
+            
+        return list(set(lessons))[:3]
+
     def _build_sources(self, results: list[dict]) -> list[dict]:
         """De-duplicate results by document_id and build source list."""
         seen: set[str] = set()
@@ -120,9 +159,38 @@ class RAGChain:
                 "department": r.get("department", ""),
                 "insurance_scheme": r.get("insurance_scheme", ""),
                 "score": r["score"],
+                "utility": r.get("utility_score", 0),
+                "is_high_utility": r.get("utility_score", 0) > 5,
                 "chunk_preview": r["chunk_text"][:200],
             })
         return sources
+
+    def _augment_with_utility(self, results: list[dict]) -> list[dict]:
+        """Fetch latest utility scores from SQLite for the retrieved documents."""
+        if not results or not self.db_path or not self.db_path.exists():
+            return results
+        
+        doc_ids = list(set(r["document_id"] for r in results))
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            placeholders = ",".join(["?"] * len(doc_ids))
+            rows = cursor.execute(
+                f"SELECT id, utility_score FROM documents WHERE id IN ({placeholders})",
+                doc_ids
+            ).fetchall()
+            
+            utility_map = {row["id"]: row["utility_score"] for row in rows}
+            conn.close()
+            
+            for r in results:
+                r["utility_score"] = utility_map.get(r["document_id"], 0)
+        except Exception as e:
+            print(f"[rag_chain] Error augmenting utility: {e}")
+            
+        return results
 
     def _format_context(self, results: list[dict]) -> str:
         """Format retrieved chunks into a context string for the LLM."""

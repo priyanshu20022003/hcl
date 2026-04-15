@@ -1,8 +1,9 @@
-﻿import json
+import json
 import re
 import time
 import urllib.error
 import urllib.request
+import requests
 
 import streamlit as st
 
@@ -85,6 +86,38 @@ def ask_backend(base_url: str, token: str, prompt: str) -> tuple[dict | None, st
     return data, None
 
 
+def transcribe_audio(base_url: str, token: str, audio_bytes: bytes) -> str | None:
+    url = f"{base_url.rstrip('/')}/api/voice/transcribe"
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    files = {"file": ("audio.wav", audio_bytes, "audio/wav")}
+    try:
+        resp = requests.post(url, headers=headers, files=files, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("transcript")
+    except Exception as e:
+        print(f"Transcription error: {e}")
+        return None
+
+
+def ocr_image(base_url: str, token: str, image_bytes: bytes, filename: str) -> str | None:
+    url = f"{base_url.rstrip('/')}/api/ocr"
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    files = {"file": (filename, image_bytes, "image/png")}
+    try:
+        resp = requests.post(url, headers=headers, files=files, timeout=120)  # OCR can be slow
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("text")
+    except Exception as e:
+        print(f"OCR error: {e}")
+        return None
+
+
 def get_health(base_url: str) -> tuple[dict | None, str | None]:
     return api_request("GET", f"{base_url.rstrip('/')}/api/health")
 
@@ -107,19 +140,55 @@ def stream_text(text: str):
 st.set_page_config(page_title="Policy Sarthi", page_icon=":speech_balloon:", layout="centered")
 init_state()
 
-st.markdown(
-    """
-    <style>
-    .block-container {padding-top: 1.6rem; padding-bottom: 1.2rem; max-width: 900px;}
-    .stChatMessage {border-radius: 14px;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# ── Premium Design System (Glassmorphism Restoration) ────────────────
+css_style = """
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+<style>
+html, body, [data-testid="stAppViewContainer"] {
+    font-family: 'Outfit', sans-serif;
+    background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+}
+.block-container { padding-top: 2rem; padding-bottom: 2rem; max-width: 950px; }
+[data-testid="stSidebar"] {
+    background: rgba(255, 255, 255, 0.7) !important;
+    backdrop-filter: blur(12px);
+    border-right: 1px solid rgba(255, 255, 255, 0.3);
+}
+[data-testid="stSidebar"] * { color: #1a2a6c !important; }
+.stChatMessage {
+    background: rgba(255, 255, 255, 0.6) !important;
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.4);
+    border-radius: 20px !important;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+    margin-bottom: 1rem;
+    transition: all 0.3s ease;
+}
+.stChatMessage:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0,0,0,0.08); }
+.stButton>button {
+    border-radius: 12px;
+    border: none;
+    background: linear-gradient(90deg, #4facfe 0%, #00f2fe 100%);
+    color: white !important;
+    font-weight: 600;
+    transition: all 0.3s ease;
+}
+.stButton>button:hover { transform: scale(1.02); box-shadow: 0 4px 12px rgba(79, 172, 254, 0.4); }
+[data-testid="stMetric"] {
+    background: white !important;
+    padding: 15px;
+    border-radius: 15px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.03);
+}
+h1, h2, h3 { color: #1a2a6c !important; font-weight: 600; }
+</style>
+"""
+st.markdown(css_style, unsafe_allow_html=True)
 
 st.title("Policy Sarthi")
 st.caption("Policy assistant UI integrated with backend APIs")
 
+# ── Sidebar Content ─────────────────────────────────────────────────
 with st.sidebar:
     st.subheader("Connection")
     backend_url = st.text_input("Backend URL", value=DEFAULT_BACKEND_URL)
@@ -130,29 +199,24 @@ with st.sidebar:
     with col1:
         if st.button("Login", use_container_width=True):
             token, err = login(backend_url, username, password)
-            if err:
-                st.error(err)
+            if err: st.error(err)
             else:
                 st.session_state.token = token
-                st.success("Logged in")
+                st.write("Logged in as:", st.session_state.current_user.get("displayName", username))
     with col2:
         if st.button("Logout", use_container_width=True):
             st.session_state.token = ""
             st.session_state.current_user = {}
-            st.info("Logged out")
+            st.rerun()
     with col3:
         if st.button("Health", use_container_width=True):
             health, err = get_health(backend_url)
-            if err:
-                st.error(f"Backend unreachable: {err}")
-            else:
-                st.success(f"Status: {health.get('status', 'ok')}")
+            if err: st.error(f"Backend unreachable: {err}")
+            else: st.success(f"Status: {health.get('status', 'ok')}")
 
     st.divider()
     if st.button("Clear Chat", use_container_width=True):
-        st.session_state.messages = [
-            {"role": "assistant", "content": "New chat started. How can I help you?"}
-        ]
+        st.session_state.messages = [{"role": "assistant", "content": "New chat started. How can I help you?"}]
         st.rerun()
 
     mode = "Connected" if st.session_state.token else "Not authenticated"
@@ -162,6 +226,34 @@ with st.sidebar:
         display_name = user.get("displayName", user.get("username", "-"))
         role = user.get("role", "-")
         st.caption(f"User: {display_name} ({role})")
+        
+    st.divider()
+    st.subheader("🔮 Intelligence Status")
+    stats, err = api_request("GET", f"{backend_url.rstrip('/')}/api/analytics")
+    if not err and stats:
+        pos = stats.get("positive", 0)
+        neg = stats.get("negative", 0)
+        total = stats.get("total", 0)
+        health, _ = get_health(backend_url)
+        policy_vecs = (health or {}).get("vectorsIndexed", 0)
+        
+        st.markdown(f"""
+        <div style="background: rgba(79, 172, 254, 0.1); padding: 15px; border-radius: 15px; border: 1px solid rgba(79, 172, 254, 0.3);">
+            <div style="font-size: 0.9rem; opacity: 0.8;">Policy Knowledge Base</div>
+            <div style="font-size: 1.5rem; font-weight: 600; color: #4facfe;">{policy_vecs} Vectors</div>
+            <hr style="margin: 10px 0; opacity: 0.2;">
+            <div style="font-size: 0.9rem; opacity: 0.8;">Experience Memories</div>
+            <div style="font-size: 1.5rem; font-weight: 600; color: #00f2fe;">{total} Lessons</div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        if total > 0:
+            rate = int((pos / total) * 100) if total > 0 else 100
+            st.write("")
+            st.caption(f"Success Rate: {rate}%")
+            st.progress(rate / 100)
+    
+    st.caption("✨ Semantic Memory Active")
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -192,5 +284,105 @@ if prompt := st.chat_input("Type your message..."):
 
         thinking_placeholder.empty()
         st.write_stream(stream_text(final_text))
+        
+        # Highlight if a semantic lesson was applied
+        if st.session_state.token and not err:
+            applied = response_data.get("appliedLessons", [])
+            if applied:
+                st.info(f"✨ **Experience Applied:** I've improved this answer using a verified lesson from my memory: *\"{applied[0]}\"*")
 
     st.session_state.messages.append({"role": "assistant", "content": final_text})
+
+
+st.divider()
+st.subheader("Visual Analysis (OCR)")
+image_file = st.file_uploader("Upload an image or document (PDF/PNG/JPG) for analysis", type=["png", "jpg", "jpeg", "pdf"])
+
+if image_file is not None:
+    # Use a unique key based on file content/name to avoid re-triggering on every rerun
+    file_key = f"last_ocr_{image_file.name}"
+    if file_key not in st.session_state:
+        st.session_state[file_key] = False
+        
+    if not st.session_state[file_key]:
+        image_bytes = image_file.read()
+        
+        with st.chat_message("user"):
+            st.markdown(f"📷 *Uploaded file: {image_file.name}*")
+            
+        with st.chat_message("assistant"):
+            ocr_placeholder = st.empty()
+            ocr_placeholder.markdown("🔍 **Analyzing document via Sarvam AI Vision...** (this may take 10-20 seconds)")
+            
+            if not st.session_state.token:
+                token, err = login(backend_url, username, password)
+                if not err:
+                    st.session_state.token = token
+            
+            extracted_text = ocr_image(backend_url, st.session_state.token, image_bytes, image_file.name)
+            
+            if not extracted_text:
+                ocr_placeholder.error("Failed to extract text from document.")
+            else:
+                ocr_placeholder.markdown(f"**Extracted Text Snippet:**\n\n{extracted_text[:300]}...")
+                st.session_state.messages.append({"role": "user", "content": f"[Document Analysis of {image_file.name}]:\n{extracted_text}"})
+                
+                thinking_placeholder = st.empty()
+                thinking_placeholder.markdown("Thinking...")
+                
+                # Automatically query RAG with extracted text
+                response_data, err = ask_backend(backend_url, st.session_state.token, extracted_text)
+                if err:
+                    final_text = f"Backend error: {err}"
+                else:
+                    final_text = build_response_markdown(response_data or {})
+                    
+                thinking_placeholder.empty()
+                st.write_stream(stream_text(final_text))
+                st.session_state.messages.append({"role": "assistant", "content": final_text})
+                st.session_state[file_key] = True
+
+
+audio_value = st.audio_input("Record a voice message")
+if audio_value is not None:
+    if "last_audio" not in st.session_state:
+        st.session_state.last_audio = None
+        
+    if audio_value != st.session_state.last_audio:
+        st.session_state.last_audio = audio_value
+        audio_bytes = audio_value.read()
+        
+        with st.chat_message("user"):
+            st.markdown("🎤 *Voice message*")
+            
+        with st.chat_message("assistant"):
+            transcript_placeholder = st.empty()
+            transcript_placeholder.markdown("Transcribing audio...")
+            
+            if not st.session_state.token:
+                token, err = login(backend_url, username, password)
+                if not err:
+                    st.session_state.token = token
+            
+            transcript = transcribe_audio(backend_url, st.session_state.token, audio_bytes)
+            
+            if not transcript:
+                transcript_placeholder.error("Failed to transcribe audio.")
+            else:
+                transcript_placeholder.markdown(f"**Transcript:** {transcript}")
+                st.session_state.messages.append({"role": "user", "content": transcript})
+                
+                thinking_placeholder = st.empty()
+                thinking_placeholder.markdown("Thinking...")
+                
+                response_data, err = ask_backend(backend_url, st.session_state.token, transcript)
+                if err:
+                    final_text = f"Backend error: {err}"
+                else:
+                    final_text = build_response_markdown(response_data or {})
+                    
+                thinking_placeholder.empty()
+                st.write_stream(stream_text(final_text))
+                st.session_state.messages.append({"role": "assistant", "content": final_text})  # Mark as done for this file
+
+
