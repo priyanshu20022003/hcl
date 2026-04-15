@@ -1,2 +1,14 @@
 python-pptx==1.0.2
 streamlit
+Flask==3.1.0
+flask-cors==5.0.1
+python-dotenv==1.0.1
+sarvamai
+uvicorn==0.34.0
+asgiref==3.8.1
+flasgger==0.9.7.1
+pypdf==5.4.0
+fastapi
+faiss-cpu
+sentence-transformers
+numpy

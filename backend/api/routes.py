@@ -1,0 +1,301 @@
+"""
+FastAPI routes for the PolicySarthi RAG pipeline.
+
+All endpoints maintain the same contract as the original Flask app so the
+Streamlit frontend works without any changes.
+"""
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
+
+router = APIRouter(prefix="/api")
+
+
+# ── Request / Response models ────────────────────────────────────────
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class QueryRequest(BaseModel):
+    query: str
+    language: str = "auto"
+    include_voice: bool = False
+
+
+class FeedbackRequest(BaseModel):
+    query: str
+    queryLogId: int | None = None
+    topDocument: str | None = None
+    topDocumentId: str | None = None
+    rating: int
+    comment: str | None = None
+    correction: str | None = None
+
+
+# ── Dependency: get app state from request ───────────────────────────
+def get_state(request: Request):
+    return request.app.state
+
+
+def get_current_user(request: Request) -> dict:
+    """Extract and validate the bearer token from the Authorization header."""
+    state = request.app.state
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = auth_header.split(" ", 1)[1]
+    user = state.tokens.get(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return user
+
+
+# ── Health ───────────────────────────────────────────────────────────
+@router.get("/health")
+def health_check(request: Request):
+    state = get_state(request)
+    return {
+        "status": "ok",
+        "service": "hospital-policy-assistant",
+        "sarvamConfigured": state.sarvam.enabled,
+        "vectorsIndexed": state.faiss_store.total_vectors,
+    }
+
+
+# ── Auth ─────────────────────────────────────────────────────────────
+@router.post("/auth/login")
+def login(body: LoginRequest, request: Request):
+    import secrets
+    state = get_state(request)
+
+    username = body.username.strip()
+    password = body.password.strip()
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Username and password are required")
+
+    user = state.user_lookup.get(username)
+    if not user or user["password"] != password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = secrets.token_urlsafe(24)
+    public_user = {
+        "id": user["id"],
+        "username": user["username"],
+        "displayName": user["display_name"],
+        "role": user["role"],
+        "department": user["department"],
+    }
+    state.tokens[token] = public_user
+    return {"token": token, "user": public_user}
+
+
+@router.get("/auth/me")
+def me(current_user: dict = Depends(get_current_user)):
+    return {"user": current_user}
+
+
+# ── RAG Query (main endpoint) ───────────────────────────────────────
+@router.post("/query")
+def query_assistant(body: QueryRequest, request: Request, current_user: dict = Depends(get_current_user)):
+    """Main RAG inference endpoint — FAISS retrieval + Sarvam LLM."""
+    state = get_state(request)
+    rag: object = state.rag_chain
+
+    result = rag.answer(
+        query=body.query,
+        preferred_language=body.language,
+        top_k=5,
+        include_voice=body.include_voice,
+    )
+
+    # Log the query
+    import sqlite3
+    from datetime import datetime
+    try:
+        conn = sqlite3.connect(str(state.db_path))
+        conn.execute(
+            "INSERT INTO query_logs (user_id, query, detected_language, top_document, created_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                current_user["id"],
+                body.query,
+                result.get("detectedLanguage", "English"),
+                result.get("topDocument", ""),
+                datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+    return result
+
+
+# ── Documents ────────────────────────────────────────────────────────
+@router.get("/documents")
+def list_documents(request: Request, current_user: dict = Depends(get_current_user)):
+    import sqlite3
+    state = get_state(request)
+    conn = sqlite3.connect(str(state.db_path))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, title, document_type, category, department, insurance_scheme, "
+        "effective_date, language, version, summary, last_updated, file_name "
+        "FROM documents ORDER BY last_updated DESC"
+    ).fetchall()
+    conn.close()
+    return {"documents": [dict(r) for r in rows]}
+
+
+@router.get("/documents/{document_id}")
+def get_document(document_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    import sqlite3
+    state = get_state(request)
+    conn = sqlite3.connect(str(state.db_path))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Document not found")
+    chunks = [
+        dict(c) for c in conn.execute(
+            "SELECT chunk_index, content FROM chunks WHERE document_id = ? ORDER BY chunk_index",
+            (document_id,),
+        ).fetchall()
+    ]
+    conn.close()
+    doc = dict(row)
+    doc["chunks"] = chunks
+    return doc
+
+
+# ── Search ───────────────────────────────────────────────────────────
+@router.get("/search")
+def search_documents(request: Request, q: str = "", current_user: dict = Depends(get_current_user)):
+    """Semantic search across the corpus using FAISS."""
+    if not q.strip():
+        return {"query": q, "results": []}
+
+    state = get_state(request)
+    from ..vector_db.embeddings import get_embedding
+    query_embedding = get_embedding(q)
+    results = state.faiss_store.search(query_embedding, top_k=10)
+
+    # De-duplicate by document
+    seen: set[str] = set()
+    unique = []
+    for r in results:
+        if r["document_id"] not in seen:
+            seen.add(r["document_id"])
+            unique.append({
+                "id": r["document_id"],
+                "title": r["title"],
+                "department": r.get("department", ""),
+                "score": r["score"],
+                "preview": r["chunk_text"][:300],
+            })
+    return {"query": q, "results": unique}
+
+
+# ── Feedback ─────────────────────────────────────────────────────────
+@router.post("/feedback")
+def submit_feedback(body: FeedbackRequest, request: Request, current_user: dict = Depends(get_current_user)):
+    if body.rating not in (-1, 1):
+        raise HTTPException(status_code=400, detail="Rating must be 1 or -1")
+    if not body.query.strip():
+        raise HTTPException(status_code=400, detail="Query is required for feedback")
+
+    import sqlite3
+    from datetime import datetime
+    state = get_state(request)
+    conn = sqlite3.connect(str(state.db_path))
+    conn.execute(
+        "INSERT INTO feedback (query_log_id, user_id, query, top_document_id, top_document, rating, comment, correction, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            body.queryLogId,
+            current_user["id"],
+            body.query,
+            body.topDocumentId,
+            body.topDocument,
+            body.rating,
+            body.comment,
+            body.correction,
+            datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Feedback saved.", "appliedSignal": "positive" if body.rating > 0 else "negative"}
+
+
+# ── Dashboard ────────────────────────────────────────────────────────
+@router.get("/dashboard")
+def dashboard(request: Request, current_user: dict = Depends(get_current_user)):
+    import sqlite3
+    state = get_state(request)
+    conn = sqlite3.connect(str(state.db_path))
+    conn.row_factory = sqlite3.Row
+    docs_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    query_count = conn.execute("SELECT COUNT(*) FROM query_logs").fetchone()[0]
+    departments = [dict(r) for r in conn.execute(
+        "SELECT department AS name, COUNT(*) AS count FROM documents GROUP BY department ORDER BY count DESC"
+    ).fetchall()]
+    top_queries = [dict(r) for r in conn.execute(
+        "SELECT query AS label, COUNT(*) AS count FROM query_logs GROUP BY query ORDER BY count DESC LIMIT 5"
+    ).fetchall()]
+    conn.close()
+
+    return {
+        "stats": {
+            "documentsIndexed": docs_count,
+            "vectorsIndexed": state.faiss_store.total_vectors,
+            "queriesHandled": query_count,
+        },
+        "departments": departments,
+        "topQueries": top_queries,
+        "roleView": current_user["role"],
+    }
+
+
+# ── Analytics ────────────────────────────────────────────────────────
+@router.get("/analytics")
+def analytics(request: Request, current_user: dict = Depends(get_current_user)):
+    if current_user["role"] not in ("admin", "auditor"):
+        raise HTTPException(status_code=403, detail="Forbidden for this role")
+
+    import sqlite3
+    state = get_state(request)
+    conn = sqlite3.connect(str(state.db_path))
+    conn.row_factory = sqlite3.Row
+    top_queries = [dict(r) for r in conn.execute(
+        "SELECT query, COUNT(*) AS count FROM query_logs GROUP BY query ORDER BY count DESC LIMIT 10"
+    ).fetchall()]
+    by_language = [dict(r) for r in conn.execute(
+        "SELECT detected_language AS language, COUNT(*) AS count FROM query_logs GROUP BY detected_language ORDER BY count DESC"
+    ).fetchall()]
+    fb = conn.execute(
+        "SELECT COALESCE(SUM(CASE WHEN rating > 0 THEN 1 ELSE 0 END),0) AS positive, "
+        "COALESCE(SUM(CASE WHEN rating < 0 THEN 1 ELSE 0 END),0) AS negative, COUNT(*) AS total FROM feedback"
+    ).fetchone()
+    conn.close()
+    return {
+        "topQueries": top_queries,
+        "languageBreakdown": by_language,
+        "feedbackSummary": dict(fb) if fb else {"positive": 0, "negative": 0, "total": 0},
+    }
+
+
+# ── Sample queries ───────────────────────────────────────────────────
+@router.get("/sample-queries")
+def sample_queries(current_user: dict = Depends(get_current_user)):
+    return {
+        "queries": [
+            "Patient ke Ayushman claim ke liye kaunse documents chahiye?",
+            "Is pre-authorization required before planned admission?",
+            "Why do Ayushman claims get rejected?",
+            "Explain the Ayushman process in Hindi.",
+            "What is the coverage under Ayushman Bharat?",
+        ]
+    }

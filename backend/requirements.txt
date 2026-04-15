@@ -6,3 +6,7 @@ uvicorn==0.34.0
 asgiref==3.8.1
 flasgger==0.9.7.1
 pypdf==5.4.0
+fastapi
+faiss-cpu
+sentence-transformers
+numpy
