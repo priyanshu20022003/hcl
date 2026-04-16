@@ -68,6 +68,7 @@ def startup():
         documents_path=DOCUMENTS_PATH,
         index_dir=FAISS_INDEX_DIR,
         max_chunk_chars=settings.max_chunk_chars,
+        db_path=db_state["db_path"],
     )
 
     # 2.5 Experience Memory Brain (Learned Lessons)

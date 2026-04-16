@@ -4,6 +4,7 @@ chunks content, embeds, and stores everything in a FAISS index.
 """
 
 import json
+import sqlite3
 from pathlib import Path
 
 from .embeddings import get_embeddings
@@ -163,11 +164,51 @@ def _index_pdf_files(
         print(f"[indexer] {pdf_path.name} -> {len(chunks)} chunks")
 
 
+def _sync_to_sqlite(db_path: Path, all_metadata: list[dict]):
+    """Ensure all document chunks are present in the SQLite database for keyword search."""
+    if not db_path:
+        return
+    
+    print(f"[indexer] Syncing {len(all_metadata)} chunks to SQLite for hybrid search...")
+    try:
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+        
+        for m in all_metadata:
+            doc_id = m["document_id"]
+            title = m["title"]
+            chunk_idx = m["chunk_index"]
+            text = m["chunk_text"]
+            
+            # 1. Ensure Document exists (basic stub if not already there)
+            cursor.execute(
+                "INSERT OR IGNORE INTO documents (id, title, document_type, category, department, insurance_scheme, summary, content, file_name, file_path, last_updated, uploaded_by, language, version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (doc_id, title, "PDF", "PDF Document", "", "", title, "", m.get("source_file", ""), "", "", "system", "en-IN", "v1")
+            )
+            
+            # 2. Insert Chunk
+            # We use a unique check or just clear old chunks for this doc first
+            if chunk_idx == -1: # Summary/Header chunk
+                continue 
+                
+            cursor.execute(
+                "INSERT INTO chunks (document_id, chunk_index, content) VALUES (?, ?, ?)",
+                (doc_id, chunk_idx, text)
+            )
+            
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[indexer] SQLite sync error: {e}")
+
+
 def build_index(
     documents_path: str | Path,
     index_dir: str | Path,
     max_chunk_chars: int = DEFAULT_CHUNK_SIZE,
     force_rebuild: bool = False,
+    db_path: Path = None,
 ) -> FaissStore:
     """Build (or load) a FAISS index from documents.json + PDF files.
 
@@ -223,6 +264,18 @@ def build_index(
         embeddings = get_embeddings(all_texts)
         store.add(embeddings, all_metadata)
         store.save(index_dir)
+        
+        # 5. Sync to SQL for keyword search
+        if db_path:
+            # Clear old chunks first to avoid duplicates on rebuild
+            try:
+                conn = sqlite3.connect(str(db_path))
+                conn.execute("DELETE FROM chunks")
+                conn.commit()
+                conn.close()
+            except: pass
+            _sync_to_sqlite(db_path, all_metadata)
+            
         print(f"[indexer] FAISS index built with {store.total_vectors} vectors")
     else:
         print("[indexer] WARNING: No content found to index.")

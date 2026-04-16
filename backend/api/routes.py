@@ -419,7 +419,8 @@ def reindex_knowledge_base(request: Request, current_user: dict = Depends(get_cu
             documents_path=DOCUMENTS_PATH,
             index_dir=FAISS_INDEX_DIR,
             max_chunk_chars=settings.max_chunk_chars,
-            force_rebuild=True
+            force_rebuild=True,
+            db_path=state.db_path
         )
         
         # 3. Hot-swap the store in the app state

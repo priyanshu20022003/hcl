@@ -41,10 +41,16 @@ class RAGChain:
         """Run the full RAG pipeline and return a structured response."""
         detected_lang = self._detect_language(query, preferred_language)
 
-        # 1. Retrieve relevant chunks from FAISS
+        # 1. Retrieve relevant chunks from FAISS (Semantic)
         query_embedding = get_embedding(query)
-        results = self.store.search(query_embedding, top_k=top_k)
+        vector_results = self.store.search(query_embedding, top_k=top_k)
         
+        # 1.2 Lexical Search (Keyword) - "The Vectorless approach"
+        keyword_results = self._keyword_search(query, top_k=top_k)
+        
+        # 1.3 Hybrid Merge
+        results = self._merge_hybrid(vector_results, keyword_results)
+
         # 1.5 Augment results with dynamic utility scores from DB
         results = self._augment_with_utility(results)
 
@@ -142,6 +148,69 @@ class RAGChain:
             print(f"[rag_chain] Error retrieving semantic lessons: {e}")
             
         return list(set(lessons))[:3]
+
+    def _keyword_search(self, query: str, top_k: int = 5) -> list[dict]:
+        """Perform a simple SQL-based keyword search across chunks."""
+        if not self.db_path or not self.db_path.exists():
+            return []
+
+        # Simple list of keywords to search for
+        words = [w.strip() for w in query.split() if len(w.strip()) > 3]
+        if not words:
+            return []
+
+        results = []
+        try:
+            conn = sqlite3.connect(str(self.db_path))
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            # Search across chunks
+            # In a real app, I'd use FTS5, but for a hackathon, LIKE is perfect
+            like_clauses = " OR content LIKE ? " * len(words)
+            params = [f"%{w}%" for w in words]
+            
+            sql = (
+                "SELECT document_id, chunk_index, content as chunk_text, "
+                "(SELECT title FROM documents WHERE id = document_id) as title, "
+                "(SELECT source_file FROM documents WHERE id = document_id) as source_file "
+                "FROM chunks WHERE " + like_clauses[4:] + f" LIMIT {top_k}"
+            )
+            
+            rows = cursor.execute(sql, params).fetchall()
+            for row in rows:
+                item = dict(row)
+                item["score"] = 0.9 # Constant high score for keyword matches
+                item["source_type"] = "sql"
+                results.append(item)
+            conn.close()
+        except Exception as e:
+            print(f"[rag_chain] Keyword search error: {e}")
+            
+        return results
+
+    def _merge_hybrid(self, vector_results: list[dict], keyword_results: list[dict]) -> list[dict]:
+        """Merge semantic and lexical results, prioritizing exact keywords."""
+        seen = set()
+        merged = []
+        
+        # 1. Prioritize Keywords (Lexical)
+        for r in keyword_results:
+            key = (r["document_id"], r["chunk_index"])
+            if key not in seen:
+                seen.add(key)
+                r["is_keyword_match"] = True
+                merged.append(r)
+                
+        # 2. Add Vector Results (Semantic)
+        for r in vector_results:
+            key = (r["document_id"], r["chunk_index"])
+            if key not in seen:
+                seen.add(key)
+                r["is_keyword_match"] = False
+                merged.append(r)
+                
+        return merged[:10]
 
     def _build_sources(self, results: list[dict]) -> list[dict]:
         """De-duplicate results by document_id and build source list."""
