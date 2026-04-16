@@ -14,6 +14,8 @@ from pathlib import Path
 from datetime import datetime
 
 from ..vector_db.embeddings import get_embedding
+from ..vector_db.indexer import build_index
+from ..config import settings
 
 router = APIRouter(prefix="/api")
 
@@ -396,3 +398,40 @@ def sample_queries(current_user: dict = Depends(get_current_user)):
             "What is the coverage under Ayushman Bharat?",
         ]
     }
+# ── Admin ──────────────────────────────────────────────────────────
+@router.post("/admin/reindex")
+def reindex_knowledge_base(request: Request, current_user: dict = Depends(get_current_user)):
+    """Manually trigger a full refresh of the FAISS index from documents.json + PDF data."""
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can re-index the knowledge base")
+
+    state = get_state(request)
+    
+    # 1. Update paths (must match main.py)
+    BASE_DIR = Path(__file__).resolve().parent.parent
+    DOCUMENTS_PATH = BASE_DIR / "data" / "documents.json"
+    FAISS_INDEX_DIR = BASE_DIR / "data" / "faiss_index"
+
+    print("[api] User-triggered re-indexing started...")
+    try:
+        # 2. Call build_index with force_rebuild=True
+        new_store = build_index(
+            documents_path=DOCUMENTS_PATH,
+            index_dir=FAISS_INDEX_DIR,
+            max_chunk_chars=settings.max_chunk_chars,
+            force_rebuild=True
+        )
+        
+        # 3. Hot-swap the store in the app state
+        state.faiss_store = new_store
+        state.rag_chain.faiss_store = new_store
+        
+        print(f"[api] Re-indexing complete. New vector count: {new_store.total_vectors}")
+        return {
+            "status": "success", 
+            "message": "Knowledge base refreshed successfully.",
+            "vectorsIndexed": new_store.total_vectors
+        }
+    except Exception as e:
+        print(f"[api] ERROR during re-indexing: {e}")
+        raise HTTPException(status_code=500, detail=f"Re-indexing failed: {str(e)}")

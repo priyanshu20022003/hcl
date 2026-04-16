@@ -221,6 +221,15 @@ with st.sidebar:
     if health: st.caption(f"Knowledge: {health.get('vectorsIndexed', 0)} vectors")
     if stats: st.caption(f"Learned Lessons: {stats.get('total', 0)}")
 
+    if st.session_state.token and st.session_state.current_user.get("role") == "admin":
+        if st.button("🔄 Update Knowledge", use_container_width=True):
+            with st.spinner("Indexing new documents..."):
+                res, err = api_request("POST", f"{backend_url.rstrip('/')}/api/admin/reindex", token=st.session_state.token)
+                if err: st.error(err)
+                else: 
+                    st.success(f"Success! {res.get('vectorsIndexed')} vectors indexed.")
+                    st.rerun()
+
 # ── Main Chat Context ───────────────────────────────────────────────
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):

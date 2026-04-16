@@ -185,28 +185,46 @@ def build_index(
     data_dir = documents_path.parent  # backend/data/
     store = FaissStore()
 
-    # Load from disk if already built
+    # 1. Discover potential files
+    pdf_files = sorted(data_dir.glob("*.pdf"))
+    current_pdf_names = {p.name for p in pdf_files}
+
+    # 2. Check if we can skip rebuild
     if not force_rebuild and (index_dir / "index.faiss").exists():
         store.load(index_dir)
-        print(f"[indexer] Loaded existing FAISS index ({store.total_vectors} vectors)")
-        return store
+        
+        # Smart Check: Are all current PDFs in the loaded index?
+        indexed_files = {m.get("source_file") for m in store.metadata if m.get("source_type") == "pdf"}
+        
+        # Also check JSON file timestamp/existence
+        if current_pdf_names == indexed_files:
+            print(f"[indexer] Smart Discovery: No changes detected. Loaded {store.total_vectors} vectors.")
+            return store
+        else:
+            diff = current_pdf_names - indexed_files
+            print(f"[indexer] Smart Discovery: Found {len(diff)} new file(s) {list(diff)}. Rebuilding index...")
+            store = FaissStore() # Reset for fresh index
 
-    # Build fresh index from all sources
+    # 3. Build fresh index from all sources
     print("[indexer] Building FAISS index from documents.json + PDFs ...")
 
     all_texts: list[str] = []
     all_metadata: list[dict] = []
 
-    # 1. JSON documents
+    # JSON documents
     _index_json_documents(documents_path, max_chunk_chars, all_texts, all_metadata)
 
-    # 2. PDF files in the data directory
+    # PDF files
     _index_pdf_files(data_dir, max_chunk_chars, all_texts, all_metadata)
 
-    # 3. Embed everything and build the index
-    print(f"[indexer] Embedding {len(all_texts)} total chunks ...")
-    embeddings = get_embeddings(all_texts)
-    store.add(embeddings, all_metadata)
-    store.save(index_dir)
-    print(f"[indexer] FAISS index built with {store.total_vectors} vectors")
+    # 4. Embed everything and build the index
+    if all_texts:
+        print(f"[indexer] Embedding {len(all_texts)} total chunks ...")
+        embeddings = get_embeddings(all_texts)
+        store.add(embeddings, all_metadata)
+        store.save(index_dir)
+        print(f"[indexer] FAISS index built with {store.total_vectors} vectors")
+    else:
+        print("[indexer] WARNING: No content found to index.")
+        
     return store

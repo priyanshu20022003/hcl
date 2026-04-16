@@ -196,8 +196,12 @@ class RAGChain:
         """Format retrieved chunks into a context string for the LLM."""
         parts = []
         for i, r in enumerate(results, 1):
+            source_info = r['title']
+            if r.get('source_file'):
+                source_info += f" (File: {r['source_file']})"
+            
             parts.append(
-                f"[Source {i}: {r['title']}]\n{r['chunk_text']}"
+                f"[Source {i}: {source_info}]\n{r['chunk_text']}"
             )
         return "\n\n".join(parts)
 
