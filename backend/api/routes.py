@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, File, UploadFile
 from pydantic import BaseModel
 import tempfile
 import os
+import shutil
 import sqlite3
 from pathlib import Path
 from datetime import datetime
@@ -436,3 +437,51 @@ def reindex_knowledge_base(request: Request, current_user: dict = Depends(get_cu
     except Exception as e:
         print(f"[api] ERROR during re-indexing: {e}")
         raise HTTPException(status_code=500, detail=f"Re-indexing failed: {str(e)}")
+
+
+@router.post("/voice-query")
+async def voice_query(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """Process a voice query: STT -> RAG -> TTS."""
+    state = get_state(request)
+    
+    # 1. Save uploaded file to temp location
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = Path(tmp.name)
+    
+    try:
+        # 2. Sarvam STT - Transcribe the audio
+        print(f"[api] Processing voice query from user: {current_user['username']}...")
+        stt_result = state.sarvam.speech_to_text(tmp_path)
+        
+        if not stt_result or not stt_result.get("transcript"):
+            return {
+                "summary": "Sorry, I could not understand the audio clearly. Please try again or type your question.",
+                "confidence": {"level": "blocked", "label": "Audio Failed"},
+                "sources": []
+            }
+        
+        transcript = stt_result["transcript"]
+        print(f"[api] Transcribed: '{transcript}' ({stt_result.get('language_code')})")
+        
+        # 3. Process with RAG chain (Always include voice for voice-to-voice flow)
+        response = state.rag_chain.answer(
+            query=transcript,
+            preferred_language=stt_result.get("language_code", "auto"),
+            include_voice=True
+        )
+        
+        # 4. Inject transcript into response so UI can show what it heard
+        response["transcription"] = transcript
+        return response
+        
+    except Exception as e:
+        print(f"[api] Voice query error: {e}")
+        raise HTTPException(status_code=500, detail=f"Voice processing failed: {str(e)}")
+    finally:
+        if tmp_path.exists():
+            os.remove(tmp_path)

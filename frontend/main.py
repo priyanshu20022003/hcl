@@ -86,8 +86,9 @@ def ask_backend(base_url: str, token: str, prompt: str) -> tuple[dict | None, st
     return data, None
 
 
-def transcribe_audio(base_url: str, token: str, audio_bytes: bytes) -> str | None:
-    url = f"{base_url.rstrip('/')}/api/voice/transcribe"
+def voice_query_api(base_url: str, token: str, audio_bytes: bytes) -> tuple[dict | None, str | None]:
+    """Call the new unified STT + RAG + TTS endpoint."""
+    url = f"{base_url.rstrip('/')}/api/voice-query"
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -95,11 +96,9 @@ def transcribe_audio(base_url: str, token: str, audio_bytes: bytes) -> str | Non
     try:
         resp = requests.post(url, headers=headers, files=files, timeout=60)
         resp.raise_for_status()
-        data = resp.json()
-        return data.get("transcript")
+        return resp.json(), None
     except Exception as e:
-        print(f"Transcription error: {e}")
-        return None
+        return None, str(e)
 
 
 def ocr_image(base_url: str, token: str, image_bytes: bytes, filename: str) -> str | None:
@@ -291,17 +290,33 @@ if img_file:
         st.session_state[key] = True
 
 if audio_val:
-    if "last_v" not in st.session_state or audio_val != st.session_state.last_v:
-        st.session_state.last_v = audio_val
+    # Use audio bytes as a key to prevent double-processing on rerun
+    if "last_v" not in st.session_state or audio_val.name != st.session_state.get("last_v_name"):
+        st.session_state.last_v_name = audio_val.name
+        
         with st.chat_message("assistant"):
-            st.markdown("🎤 Transcribing voice...")
-            txt = transcribe_audio(backend_url, st.session_state.token, audio_val.read())
-            if txt:
-                st.markdown(f"**Transcript:** {txt}")
-                st.session_state.messages.append({"role": "user", "content": txt})
-                res, _ = ask_backend(backend_url, st.session_state.token, txt)
-                ans = build_response_markdown(res or {})
+            st.markdown("🎤 **Voice Intelligence processing...**")
+            res_data, err = voice_query_api(backend_url, st.session_state.token, audio_val.read())
+            
+            if err:
+                st.error(f"Voice query failed: {err}")
+            elif res_data:
+                transcript = res_data.get("transcription", "Unknown speech")
+                st.info(f"✨ **Heard:** \"{transcript}\"")
+                
+                # Build answer
+                ans = build_response_markdown(res_data)
+                
+                # Audio Playback (Voice-to-Voice)
+                voice_data = res_data.get("voicePlayback")
+                if voice_data and voice_data.get("audioBase64"):
+                    st.audio(f"data:audio/wav;base64,{voice_data['audioBase64']}", autoplay=True)
+                
+                # Stream the text response
                 st.write_stream(stream_text(ans))
+                
+                # Sync messages
+                st.session_state.messages.append({"role": "user", "content": f"[Voice Query]: {transcript}"})
                 st.session_state.messages.append({"role": "assistant", "content": ans})
 
 
